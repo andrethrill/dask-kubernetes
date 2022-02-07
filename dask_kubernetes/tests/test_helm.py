@@ -3,6 +3,7 @@ import pytest
 import subprocess
 import os.path
 
+import dask.config
 from distributed.core import Status
 from dask_ctl.discovery import (
     list_discovery_methods,
@@ -62,7 +63,18 @@ def release(k8s_cluster, chart_name, test_namespace, release_name, config_path):
             config_path,
         ]
     )
-    # time.sleep(10)  # Wait for scheduler to start. TODO Replace with more robust check.
+    # Scale back the additional workers group for now
+    subprocess.check_output(
+        [
+            "kubectl",
+            "scale",
+            "-n",
+            test_namespace,
+            "deployment",
+            f"{release_name}-dask-worker-foo",
+            "--replicas=0",
+        ]
+    )
     yield release_name
     subprocess.check_output(["helm", "delete", "-n", test_namespace, release_name])
 
@@ -71,11 +83,21 @@ def release(k8s_cluster, chart_name, test_namespace, release_name, config_path):
 async def cluster(k8s_cluster, release, test_namespace):
     from dask_kubernetes import HelmCluster
 
-    async with HelmCluster(
-        release_name=release, namespace=test_namespace, asynchronous=True
-    ) as cluster:
-        await cluster
-        yield cluster
+    tries = 5
+    while True:
+        try:
+            cluster = await HelmCluster(
+                release_name=release, namespace=test_namespace, asynchronous=True
+            )
+            break
+        except ConnectionError as e:
+            if tries > 0:
+                tries -= 1
+            else:
+                raise e
+
+    yield cluster
+    await cluster.close()
 
 
 @pytest.fixture
@@ -133,6 +155,22 @@ async def test_scale_cluster(cluster):
     await cluster  # Wait for workers
     assert len(cluster.scheduler_info["workers"]) == 3
 
+    # Scale up an additional worker group 'foo'
+    await cluster.scale(2, worker_group="foo")
+    await cluster  # Wait for workers
+    assert len(cluster.scheduler_info["workers"]) == 5
+
+    # Scale down an additional worker group 'foo'
+    await cluster.scale(0, worker_group="foo")
+    await cluster  # Wait for workers
+    assert len(cluster.scheduler_info["workers"]) == 3
+
+    # Scaling a non-existent eorker group 'bar' raises a ValueError
+    import kubernetes_asyncio as kubernetes
+
+    with pytest.raises((ValueError, kubernetes.client.exceptions.ApiException)):
+        await cluster.scale(2, worker_group="bar")
+
 
 @pytest.mark.asyncio
 async def test_logs(cluster):
@@ -155,10 +193,15 @@ async def test_adaptivity_warning(cluster):
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(reason="Has asyncio issues on CI")
 async def test_discovery(release, release_name):
     discovery = "helmcluster"
+    methods = list_discovery_methods()
 
-    assert discovery in list_discovery_methods()
+    assert discovery in methods
+
+    methods.pop(discovery)
+    dask.config.set({"ctl.disable-discovery": methods})
 
     clusters_names = [
         cluster async for cluster in discover_cluster_names(discovery=discovery)
@@ -172,5 +215,3 @@ async def test_discovery(release, release_name):
     assert cluster.status == Status.running
     assert cluster.release_name == release_name
     assert "id" in cluster.scheduler_info
-
-    assert b"testrelease" in subprocess.check_output(["daskctl", "cluster", "list"])
