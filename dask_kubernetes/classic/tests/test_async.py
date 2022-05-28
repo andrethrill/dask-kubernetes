@@ -1,3 +1,4 @@
+import pytest_asyncio
 import asyncio
 import base64
 import getpass
@@ -23,6 +24,7 @@ from dask_kubernetes import (
 from dask.utils import tmpfile
 from distributed.utils_test import captured_logger
 
+from dask_kubernetes.constants import KUBECLUSTER_CONTAINER_NAME
 
 TEST_DIR = os.path.abspath(os.path.join(__file__, ".."))
 CONFIG_DEMO = os.path.join(TEST_DIR, "config-demo.yaml")
@@ -41,14 +43,6 @@ def pod_spec(docker_image):
     )
 
 
-@pytest.fixture(scope="module")
-def event_loop(request):
-    """Override function-scoped fixture in pytest-asyncio."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
 @pytest.fixture
 def user_env():
     """The env var USER is not always set on non-linux systems."""
@@ -63,22 +57,28 @@ def user_env():
 cluster_kwargs = {"asynchronous": True}
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def cluster(k8s_cluster, pod_spec):
     async with KubeCluster(pod_spec, **cluster_kwargs) as cluster:
         yield cluster
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def remote_cluster(k8s_cluster, pod_spec):
     async with KubeCluster(pod_spec, deploy_mode="remote", **cluster_kwargs) as cluster:
         yield cluster
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def client(cluster):
     async with Client(cluster, asynchronous=True) as client:
         yield client
+
+
+@pytest.mark.asyncio
+async def test_fixtures(client):
+    """An initial test to get all the fixtures to run and check the cluster is usable."""
+    assert client
 
 
 @pytest.mark.asyncio
@@ -102,8 +102,7 @@ async def test_basic(cluster, client):
     result = await future
     assert result == 11
 
-    while len(cluster.scheduler_info["workers"]) < 2:
-        await asyncio.sleep(0.1)
+    await client.wait_for_workers(2)
 
     # Ensure that inter-worker communication works well
     futures = client.map(lambda x: x + 1, range(10))
@@ -118,10 +117,8 @@ async def test_logs(remote_cluster):
     cluster.scale(2)
     await cluster
 
-    start = time()
-    while len(cluster.scheduler_info["workers"]) < 2:
-        await asyncio.sleep(0.1)
-        assert time() < start + 20
+    async with Client(cluster, asynchronous=True) as client:
+        await client.wait_for_workers(2)
 
     logs = await cluster.get_logs()
     assert len(logs) == 4
@@ -174,11 +171,6 @@ async def test_adapt(cluster):
         result = await future
         assert result == 11
 
-    start = time()
-    while cluster.scheduler_info["workers"]:
-        await asyncio.sleep(0.1)
-        assert time() < start + 20
-
 
 @pytest.mark.xfail(reason="The widget has changed upstream")
 @pytest.mark.asyncio
@@ -204,8 +196,7 @@ async def test_env(k8s_cluster, pod_spec):
         cluster.scale(1)
         await cluster
         async with Client(cluster, asynchronous=True) as client:
-            while not cluster.scheduler_info["workers"]:
-                await asyncio.sleep(0.1)
+            await client.wait_for_workers(1)
             env = await client.run(lambda: dict(os.environ))
             assert all(v["ABC"] == "DEF" for v in env.values())
 
@@ -226,7 +217,7 @@ async def test_pod_from_yaml(k8s_cluster, docker_image):
                     ],
                     "image": docker_image,
                     "imagePullPolicy": "IfNotPresent",
-                    "name": "dask-worker",
+                    "name": KUBECLUSTER_CONTAINER_NAME,
                 }
             ]
         },
@@ -243,10 +234,7 @@ async def test_pod_from_yaml(k8s_cluster, docker_image):
                 result = await future.result(timeout=10)
                 assert result == 11
 
-                start = time()
-                while len(cluster.scheduler_info["workers"]) < 2:
-                    await asyncio.sleep(0.1)
-                    assert time() < start + 20, "timeout"
+                await client.wait_for_workers(2)
 
                 # Ensure that inter-worker communication works well
                 futures = client.map(lambda x: x + 1, range(10))
@@ -274,7 +262,7 @@ async def test_pod_expand_env_vars(k8s_cluster, docker_image):
                         ],
                         "image": "${FOO_IMAGE}",
                         "imagePullPolicy": "IfNotPresent",
-                        "name": "dask-worker",
+                        "name": KUBECLUSTER_CONTAINER_NAME,
                     }
                 ]
             },
@@ -308,7 +296,7 @@ async def test_pod_template_dict(docker_image):
                     "command": None,
                     "image": docker_image,
                     "imagePullPolicy": "IfNotPresent",
-                    "name": "dask-worker",
+                    "name": KUBECLUSTER_CONTAINER_NAME,
                 }
             ]
         },
@@ -322,8 +310,7 @@ async def test_pod_template_dict(docker_image):
             result = await future
             assert result == 11
 
-            while len(cluster.scheduler_info["workers"]) < 2:
-                await asyncio.sleep(0.1)
+            await client.wait_for_workers(2)
 
             # Ensure that inter-worker communication works well
             futures = client.map(lambda x: x + 1, range(10))
@@ -349,7 +336,7 @@ async def test_pod_template_minimal_dict(k8s_cluster, docker_image):
                     "command": None,
                     "image": docker_image,
                     "imagePullPolicy": "IfNotPresent",
-                    "name": "worker",
+                    "name": KUBECLUSTER_CONTAINER_NAME,
                 }
             ]
         }
@@ -365,11 +352,28 @@ async def test_pod_template_minimal_dict(k8s_cluster, docker_image):
 
 @pytest.mark.asyncio
 async def test_pod_template_from_conf(docker_image):
-    spec = {"spec": {"containers": [{"name": "some-name", "image": docker_image}]}}
+    spec = {
+        "spec": {
+            "containers": [{"name": KUBECLUSTER_CONTAINER_NAME, "image": docker_image}]
+        }
+    }
 
     with dask.config.set({"kubernetes.worker-template": spec}):
         async with KubeCluster(**cluster_kwargs) as cluster:
-            assert cluster.pod_template.spec.containers[0].name == "some-name"
+            assert (
+                cluster.pod_template.spec.containers[0].name
+                == KUBECLUSTER_CONTAINER_NAME
+            )
+
+
+@pytest.mark.asyncio
+async def test_pod_template_with_custom_container_name(docker_image):
+    container_name = "my-custom-container"
+    spec = {"spec": {"containers": [{"name": container_name, "image": docker_image}]}}
+
+    with dask.config.set({"kubernetes.worker-template": spec}):
+        async with KubeCluster(**cluster_kwargs) as cluster:
+            assert cluster.pod_template.spec.containers[0].name == container_name
 
 
 @pytest.mark.asyncio
@@ -405,7 +409,7 @@ async def test_reject_evicted_workers(cluster):
     await cluster.core_api.create_namespaced_pod_eviction(
         (await worker.describe_pod()).metadata.name,
         (await worker.describe_pod()).metadata.namespace,
-        kubernetes.client.V1beta1Eviction(
+        kubernetes.client.V1Eviction(
             delete_options=kubernetes.client.V1DeleteOptions(grace_period_seconds=300),
             metadata=(await worker.describe_pod()).metadata,
         ),
@@ -462,9 +466,7 @@ async def test_scale_up_down_fast(cluster, client):
     await cluster
 
     start = time()
-    while len(cluster.scheduler_info["workers"]) != 1:
-        await asyncio.sleep(0.1)
-        assert time() < start + 20
+    await client.wait_for_workers(1)
 
     worker = next(iter(cluster.scheduler_info["workers"].values()))
 
@@ -573,7 +575,7 @@ async def test_automatic_startup(k8s_cluster, docker_image):
                         "1",
                     ],
                     "image": docker_image,
-                    "name": "dask-worker",
+                    "name": KUBECLUSTER_CONTAINER_NAME,
                 }
             ]
         },
@@ -627,7 +629,9 @@ async def test_maximum(cluster):
                 await asyncio.sleep(0.1)
                 assert time() < start + 60
             await asyncio.sleep(0.5)
-            assert len(cluster.scheduler_info["workers"]) == 1
+            while len(cluster.scheduler_info["workers"]) != 1:
+                await asyncio.sleep(0.1)
+                assert time() < start + 60
 
         result = logger.getvalue()
         assert "scale beyond maximum number of workers" in result.lower()
@@ -764,8 +768,7 @@ async def test_auth_explicit():
 async def test_start_with_workers(k8s_cluster, pod_spec):
     async with KubeCluster(pod_spec, n_workers=2, **cluster_kwargs) as cluster:
         async with Client(cluster, asynchronous=True) as client:
-            while len(cluster.scheduler_info["workers"]) != 2:
-                await asyncio.sleep(0.1)
+            await client.wait_for_workers(2)
 
 
 @pytest.mark.asyncio
@@ -800,7 +803,7 @@ async def test_adapt_delete(cluster, ns):
         worker_pods = await get_worker_pods()
         if to_delete not in worker_pods:
             break
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.1)
         assert time() < start + 20
     # test whether adapt will bring it back
     start = time()

@@ -12,11 +12,11 @@ import dask
 import dask.distributed
 import distributed.security
 from distributed.deploy import SpecCluster, ProcessInterface
-from distributed.utils import Log, Logs
+from distributed.utils import format_dashboard_link, Log, Logs
 import kubernetes_asyncio as kubernetes
 from kubernetes_asyncio.client.rest import ApiException
 
-from .objects import (
+from ..common.objects import (
     make_pod_from_dict,
     make_service_from_dict,
     make_pdb_from_dict,
@@ -24,11 +24,14 @@ from .objects import (
     clean_service_template,
     clean_pdb_template,
 )
-from .auth import ClusterAuth
-from .utils import (
+from ..common.auth import ClusterAuth
+from ..common.utils import (
     namespace_default,
     escape,
+)
+from ..common.networking import (
     get_external_address_for_scheduler_service,
+    port_forward_dashboard,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,7 +84,7 @@ class Pod(ProcessInterface):
             except ApiException as e:
                 if retry_count < 10:
                     logger.debug("Error when creating pod, retrying... - %s", str(e))
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.1)
                     retry_count += 1
                 else:
                     raise e
@@ -106,7 +109,9 @@ class Pod(ProcessInterface):
     async def logs(self):
         try:
             log = await self.core_api.read_namespaced_pod_log(
-                self._pod.metadata.name, self.namespace
+                self._pod.metadata.name,
+                self.namespace,
+                container=self.pod_template.spec.containers[0].name,
             )
         except ApiException as e:
             if "waiting to start" in str(e):
@@ -165,12 +170,19 @@ class Scheduler(Pod):
         Set to 0 to disable the timeout (not recommended).
     """
 
-    def __init__(self, idle_timeout: str, service_wait_timeout_s: int = None, **kwargs):
+    def __init__(
+        self,
+        idle_timeout: str,
+        service_wait_timeout_s: int = None,
+        service_name_retries: int = None,
+        **kwargs
+    ):
         super().__init__(**kwargs)
         self.cluster._log("Creating scheduler pod on cluster. This may take some time.")
         self.service = None
         self._idle_timeout = idle_timeout
         self._service_wait_timeout_s = service_wait_timeout_s
+        self._service_name_retries = service_name_retries
         if self._idle_timeout is not None:
             self.pod_template.spec.containers[0].args += [
                 "--idle-timeout",
@@ -198,7 +210,9 @@ class Scheduler(Pod):
             port=SCHEDULER_PORT,
         )
         self.external_address = await get_external_address_for_scheduler_service(
-            self.core_api, self.service
+            self.core_api,
+            self.service,
+            service_name_resolution_retries=self._service_name_retries,
         )
 
         self.pdb = await self._create_pdb()
@@ -329,16 +343,21 @@ class KubeCluster(SpecCluster):
         Timeout, in seconds, to wait for the remote scheduler service to be ready.
         Defaults to 30 seconds.
         Set to 0 to disable the timeout (not recommended).
+    scheduler_service_name_resolution_retries: int (optional)
+        Number of retries to resolve scheduler service name when running
+        from within the Kubernetes cluster.
+        Defaults to 20.
+        Must be set to 1 or greater.
     deploy_mode: str (optional)
         Run the scheduler as "local" or "remote".
         Defaults to ``"remote"``.
     **kwargs: dict
-        Additional keyword arguments to pass to LocalCluster
+        Additional keyword arguments to pass to SpecCluster
 
     Examples
     --------
     >>> from dask_kubernetes import KubeCluster, make_pod_spec
-    >>> pod_spec = make_pod_spec(image='daskdev/dask:latest',
+    >>> pod_spec = make_pod_spec(image='ghcr.io/dask/dask:latest',
     ...                          memory_limit='4G', memory_request='4G',
     ...                          cpu_limit=1, cpu_request=1,
     ...                          env={'EXTRA_PIP_PACKAGES': 'fastparquet git+https://github.com/dask/distributed'})
@@ -367,7 +386,7 @@ class KubeCluster(SpecCluster):
 
     >>> client.get_versions(check=True)
 
-    The ``daskdev/dask`` docker images support ``EXTRA_PIP_PACKAGES``,
+    The ``ghcr.io/dask/dask`` docker images support ``EXTRA_PIP_PACKAGES``,
     ``EXTRA_APT_PACKAGES`` and ``EXTRA_CONDA_PACKAGES`` environment variables
     to help with small adjustments to the worker environments.  We recommend
     the use of pip over conda in this case due to a much shorter startup time.
@@ -414,6 +433,7 @@ class KubeCluster(SpecCluster):
         dashboard_address=None,
         security=None,
         scheduler_service_wait_timeout=None,
+        scheduler_service_name_resolution_retries=None,
         scheduler_pod_template=None,
         **kwargs
     ):
@@ -459,6 +479,10 @@ class KubeCluster(SpecCluster):
             "kubernetes.scheduler-service-wait-timeout",
             override_with=scheduler_service_wait_timeout,
         )
+        self._scheduler_service_name_resolution_retries = dask.config.get(
+            "kubernetes.scheduler-service-name-resolution-retries",
+            override_with=scheduler_service_name_resolution_retries,
+        )
         self.security = security
         if self.security and not isinstance(
             self.security, distributed.security.Security
@@ -472,6 +496,11 @@ class KubeCluster(SpecCluster):
         self.auth = auth
         self.kwargs = kwargs
         super().__init__(**self.kwargs)
+
+    @property
+    def dashboard_link(self):
+        host = self.scheduler_address.split("://")[1].split("/")[0].split(":")[0]
+        return format_dashboard_link(host, self.forwarded_dashboard_port)
 
     def _get_pod_template(self, pod_template, pod_type):
         if not pod_template and dask.config.get(
@@ -547,8 +576,9 @@ class KubeCluster(SpecCluster):
         if self.namespace is None:
             self.namespace = namespace_default()
 
+        environ = {k: v for k, v in os.environ.items() if k not in ["user", "uuid"]}
         self._generate_name = self._generate_name.format(
-            user=getpass.getuser(), uuid=str(uuid.uuid4())[:10], **os.environ
+            user=getpass.getuser(), uuid=str(uuid.uuid4())[:10], **environ
         )
         self._generate_name = escape(self._generate_name)
 
@@ -585,6 +615,7 @@ class KubeCluster(SpecCluster):
                 "options": {
                     "idle_timeout": self._idle_timeout,
                     "service_wait_timeout_s": self._scheduler_service_wait_timeout,
+                    "service_name_retries": self._scheduler_service_name_resolution_retries,
                     "pod_template": self.scheduler_pod_template,
                     **common_options,
                 },
@@ -602,6 +633,10 @@ class KubeCluster(SpecCluster):
 
         await super()._start()
 
+        self.forwarded_dashboard_port = await port_forward_dashboard(
+            self.name, self.namespace
+        )
+
     @classmethod
     def from_dict(cls, pod_spec, **kwargs):
         """Create cluster with worker pod spec defined by Python dictionary
@@ -618,7 +653,7 @@ class KubeCluster(SpecCluster):
         ...                      '--nthreads', '1',
         ...                      '--death-timeout', '60'],
         ...             'command': None,
-        ...             'image': 'daskdev/dask:latest',
+        ...             'image': 'ghcr.io/dask/dask:latest',
         ...             'name': 'dask-worker',
         ...         }],
         ...     'restartPolicy': 'Never',
@@ -653,7 +688,7 @@ class KubeCluster(SpecCluster):
                 baz: quux
             spec:
               containers:
-              - image: daskdev/dask:latest
+              - image: ghcr.io/dask/dask:latest
                 name: dask-worker
                 args: [dask-worker, $(DASK_SCHEDULER_ADDRESS), --nthreads, '2', --memory-limit, 8GB]
               restartPolicy: Never
